@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 import scipy.io
-import h5py
 import torch.nn as nn
 
 import operator
