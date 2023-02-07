@@ -8,6 +8,7 @@ which takes the 2D spatial + 1D temporal equation directly as a 3D problem
 import torch.nn.functional as F
 from utilities3 import *
 from timeit import default_timer
+from sklearn import decomposition
 
 torch.manual_seed(0)
 np.random.seed(0)
@@ -96,7 +97,7 @@ class FNO3d(nn.Module):
         self.width = width
         self.padding = 6 # pad the domain if input is non-periodic
 
-        self.p = nn.Linear(13, self.width)# input channel is 12: the solution of the first 10 timesteps + 3 locations (u(1, x, y), ..., u(10, x, y),  x, y, t)
+        self.p = nn.Linear(T+3, self.width)# input channel is 12: the solution of the first 10 timesteps + 3 locations (u(1, x, y), ..., u(10, x, y),  x, y, t)
         self.conv0 = SpectralConv3d(self.width, self.width, self.modes1, self.modes2, self.modes3)
         self.conv1 = SpectralConv3d(self.width, self.width, self.modes1, self.modes2, self.modes3)
         self.conv2 = SpectralConv3d(self.width, self.width, self.modes1, self.modes2, self.modes3)
@@ -161,69 +162,91 @@ class FNO3d(nn.Module):
 # configs
 ################################################################
 
-TRAIN_PATH = 'data/ns_data_V100_N1000_T50_1.mat'
-TEST_PATH = 'data/ns_data_V100_N1000_T50_2.mat'
+TRAIN_PATH = 'data/train_p.pkl'
+VAL_PATH = 'data/val_p.pkl'
+TEST_PATH = 'data/test_p.pkl'
 
-ntrain = 1000
-ntest = 200
+ntrain = 23
+ntest = 400 // 13 + 1
 
 modes = 8
-width = 20
+width = 8
 
-batch_size = 10
-batch_size2 = batch_size
+batch_size = 8
+learning_rate = 0.00005
+epochs = 1500
+iterations = epochs*(ntrain//batch_size)
 
-epochs = 500
-learning_rate = 0.001
-scheduler_step = 100
-scheduler_gamma = 0.5
-
-print(epochs, learning_rate, scheduler_step, scheduler_gamma)
-
-path = 'test'
-# path = 'ns_fourier_V100_N'+str(ntrain)+'_ep' + str(epochs) + '_m' + str(modes) + '_w' + str(width)
+path = 'ns_fourier_3d_N'+str(ntrain)+'_ep' + str(epochs) + '_m' + str(modes) + '_w' + str(width)
 path_model = 'model/'+path
 path_train_err = 'results/'+path+'train.txt'
 path_test_err = 'results/'+path+'test.txt'
 path_image = 'image/'+path
 
-
 runtime = np.zeros(2, )
 t1 = default_timer()
 
-
 sub = 1
-S = 64 // sub
-T_in = 10
-T = 40
+WIDTH = 24 // sub # 336 // sub
+HEIGHT = 24 // sub # 51 // sub
+T_in = 13
+T = 13
+assert T == T_in  # because later [:,:,:T] would be fed to the model
+# assert ntrain*T_in*T == 499 _ 99 = 598
+# would do 23 training examples. each with 13 train, 13 test
+# 23 * 26 = 598
+
 
 ################################################################
 # load data
 ################################################################
 
-reader = MatReader(TRAIN_PATH)
-train_a = reader.read_field('u')[:ntrain,::sub,::sub,:T_in]
-train_u = reader.read_field('u')[:ntrain,::sub,::sub,T_in:T+T_in]
+import pickle
+def load_pickle(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 
-reader = MatReader(TEST_PATH)
-test_a = reader.read_field('u')[-ntest:,::sub,::sub,:T_in]
-test_u = reader.read_field('u')[-ntest:,::sub,::sub,T_in:T+T_in]
+def preprocess(pca, data):
+    if not pca:
+        pca = decomposition.PCA(n_components=WIDTH*HEIGHT).fit(data)
+    data = pca.transform(data)
+    new_data = data[:data.shape[0] // T * T, :WIDTH*HEIGHT].reshape(T, WIDTH, HEIGHT, -1)
+    # new_data = torch.from_numpy(np.array(range(data.shape[0]*WIDTH*HEIGHT), dtype=np.float32).
+    #                             reshape(ntrain, WIDTH, HEIGHT, data.shape[0]))
+    # slice the train and test
+    a = new_data[:,:,:,::2]
+    u = new_data[:,:,:,1::2]
+    if a.shape[-1] - u.shape[-1] == 1:
+       a = a[:,:,:,:-1]
+    return pca, torch.from_numpy(a).type(torch.float32), torch.from_numpy(u).type(torch.float32)
 
+pca = None
+train = load_pickle(TRAIN_PATH)
+val = load_pickle(VAL_PATH)
+data = np.concatenate((train, val), axis=0)
+
+pca, train_a, train_u = preprocess(pca, data)
 print(train_u.shape)
-print(test_u.shape)
-assert (S == train_u.shape[-2])
-assert (T == train_u.shape[-1])
+assert (WIDTH == train_u.shape[-3])
+assert (HEIGHT == train_u.shape[-2])
 
+_, test_a, test_u = preprocess(pca, load_pickle(TEST_PATH))
+
+train_a = train_a.permute(3,1,2,0)
+test_a = test_a.permute(3,1,2,0)
 
 a_normalizer = UnitGaussianNormalizer(train_a)
 train_a = a_normalizer.encode(train_a)
 test_a = a_normalizer.encode(test_a)
 
+
+train_a = train_a.unsqueeze(3).repeat([1,1,1,T,1])
+train_u = train_u.permute(3,1,2,0)
+test_a = test_a.unsqueeze(3).repeat([1,1,1,T,1])
+test_u = test_u.permute(3,1,2,0)
+
 y_normalizer = UnitGaussianNormalizer(train_u)
 train_u = y_normalizer.encode(train_u)
-
-train_a = train_a.reshape(ntrain,S,S,1,T_in).repeat([1,1,1,T,1])
-test_a = test_a.reshape(ntest,S,S,1,T_in).repeat([1,1,1,T,1])
 
 train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_a, train_u), batch_size=batch_size, shuffle=True)
 test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_a, test_u), batch_size=batch_size, shuffle=False)
@@ -236,74 +259,70 @@ device = torch.device('cuda')
 ################################################################
 # training and evaluation
 ################################################################
-model = FNO3d(modes, modes, modes, width).cuda()
-# model = torch.load('model/ns_fourier_V100_N1000_ep100_m8_w20')
-
+model = FNO3d(modes, modes, modes, width)
 print(count_params(model))
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-3)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iterations)
 
+import tqdm
 
 myloss = LpLoss(size_average=False)
-y_normalizer.cuda()
 for ep in range(epochs):
     model.train()
     t1 = default_timer()
     train_mse = 0
     train_l2 = 0
-    for x, y in train_loader:
-        x, y = x.cuda(), y.cuda()
+    for x, y in tqdm.tqdm(train_loader):
 
         optimizer.zero_grad()
-        out = model(x).view(batch_size, S, S, T)
+        out = model(x)
+        out = out.view(out.shape[0], WIDTH, HEIGHT, T)
 
         mse = F.mse_loss(out, y, reduction='mean')
-        # mse.backward()
+        mse.backward()
 
-        y = y_normalizer.decode(y)
-        out = y_normalizer.decode(out)
-        l2 = myloss(out.view(batch_size, -1), y.view(batch_size, -1))
-        l2.backward()
+        # y = y_normalizer.decode(y)
+        # out = y_normalizer.decode(out)
+        # l2 = myloss(out, y)
+        # l2.backward()
 
         optimizer.step()
+        scheduler.step()
         train_mse += mse.item()
-        train_l2 += l2.item()
-
-    scheduler.step()
 
     model.eval()
-    test_l2 = 0.0
+    test_mse = 0.0
     with torch.no_grad():
         for x, y in test_loader:
-            x, y = x.cuda(), y.cuda()
-
-            out = model(x).view(batch_size, S, S, T)
+            out = model(x)
+            out = out.view(out.shape[0], WIDTH, HEIGHT, T)
             out = y_normalizer.decode(out)
-            test_l2 += myloss(out.view(batch_size, -1), y.view(batch_size, -1)).item()
+            test_mse += F.mse_loss(out, y).item()
 
     train_mse /= len(train_loader)
     train_l2 /= ntrain
-    test_l2 /= ntest
+    test_mse /= ntest
 
     t2 = default_timer()
-    print(ep, t2-t1, train_mse, train_l2, test_l2)
-# torch.save(model, path_model)
+    print(ep, t2-t1, train_mse, train_l2, test_mse)
+torch.save(model, path_model)
 
-
+# =============================
+model = torch.load(path_model)
 pred = torch.zeros(test_u.shape)
 index = 0
+test_loss = 0
 test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_a, test_u), batch_size=1, shuffle=False)
 with torch.no_grad():
     for x, y in test_loader:
-        test_l2 = 0
-        x, y = x.cuda(), y.cuda()
 
         out = model(x)
+        out = out.view(out.shape[0], WIDTH, HEIGHT, T)
         out = y_normalizer.decode(out)
         pred[index] = out
 
-        test_l2 += myloss(out.view(1, -1), y.view(1, -1)).item()
-        print(index, test_l2)
+        test_loss += F.mse_loss(out, y, reduction='mean')
+        print(index, test_loss)
         index = index + 1
 
 scipy.io.savemat('pred/'+path+'.mat', mdict={'pred': pred.cpu().numpy()})
