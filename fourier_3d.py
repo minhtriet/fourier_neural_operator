@@ -3,8 +3,8 @@
 This file is the Fourier Neural Operator for 3D problem such as the Navier-Stokes equation discussed in Section 5.3 in the [paper](https://arxiv.org/pdf/2010.08895.pdf),
 which takes the 2D spatial + 1D temporal equation directly as a 3D problem
 """
-
-
+import torch
+# best: 8.4, 367 iter   6.353 1k iter ( weight_decay=1e-1)  6.13
 import torch.nn.functional as F
 from utilities3 import *
 from timeit import default_timer
@@ -169,15 +169,15 @@ TEST_PATH = 'data/test_p.pkl'
 ntrain = 23
 ntest = 400 // 13 + 1
 
-modes = 8
-width = 8
-
+modes = 2
+width = 2
+# no params 1049897, 262549
 batch_size = 8
-learning_rate = 0.00005
-epochs = 1500
+learning_rate = 1e-4
+epochs = 3000
 iterations = epochs*(ntrain//batch_size)
 
-path = 'ns_fourier_3d_N'+str(ntrain)+'_ep' + str(epochs) + '_m' + str(modes) + '_w' + str(width)
+path = 'ns_fourier_3d_N'+str(ntrain)+'_ep' + str(epochs) + '_m' + str(modes) + '_w' + str(width) + '_lr' + str(learning_rate)
 path_model = 'model/'+path
 path_train_err = 'results/'+path+'train.txt'
 path_test_err = 'results/'+path+'test.txt'
@@ -226,10 +226,16 @@ val = load_pickle(VAL_PATH)
 data = np.concatenate((train, val), axis=0)
 
 pca, train_a, train_u = preprocess(pca, data)
+
 print(train_u.shape)
 assert (WIDTH == train_u.shape[-3])
 assert (HEIGHT == train_u.shape[-2])
 
+def save_pickle(data, path):
+    with open(path, 'wb') as f:
+        pickle.dump(data, f)
+
+save_pickle(pca, 'pca.pkl')
 _, test_a, test_u = preprocess(pca, load_pickle(TEST_PATH))
 
 train_a = train_a.permute(3,1,2,0)
@@ -238,7 +244,7 @@ test_a = test_a.permute(3,1,2,0)
 a_normalizer = UnitGaussianNormalizer(train_a)
 train_a = a_normalizer.encode(train_a)
 test_a = a_normalizer.encode(test_a)
-
+save_pickle(a_normalizer, "unit_gaussian_normalizer.pkl")
 
 train_a = train_a.unsqueeze(3).repeat([1,1,1,T,1])
 train_u = train_u.permute(3,1,2,0)
@@ -259,75 +265,92 @@ device = torch.device('cuda')
 ################################################################
 # training and evaluation
 ################################################################
-model = FNO3d(modes, modes, modes, width)
-print(count_params(model))
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-3)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iterations)
-
-import tqdm
-
-myloss = LpLoss(size_average=False)
-for ep in range(epochs):
-    model.train()
-    t1 = default_timer()
-    train_mse = 0
-    train_l2 = 0
-    for x, y in tqdm.tqdm(train_loader):
-
-        optimizer.zero_grad()
-        out = model(x)
-        out = out.view(out.shape[0], WIDTH, HEIGHT, T)
-
-        mse = F.mse_loss(out, y, reduction='mean')
-        mse.backward()
-
-        # y = y_normalizer.decode(y)
-        # out = y_normalizer.decode(out)
-        # l2 = myloss(out, y)
-        # l2.backward()
-
-        optimizer.step()
-        scheduler.step()
-        train_mse += mse.item()
-
-    model.eval()
-    test_mse = 0.0
-    with torch.no_grad():
-        for x, y in test_loader:
-            out = model(x)
-            out = out.view(out.shape[0], WIDTH, HEIGHT, T)
-            out = y_normalizer.decode(out)
-            test_mse += F.mse_loss(out, y).item()
-
-    train_mse /= len(train_loader)
-    train_l2 /= ntrain
-    test_mse /= ntest
-
-    t2 = default_timer()
-    print(ep, t2-t1, train_mse, train_l2, test_mse)
-torch.save(model, path_model)
+# model = FNO3d(modes, modes, modes, width)
+# print(count_params(model))
+# optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-1)
+# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iterations)
+#
+# import tqdm
+# min_mse = 2**32
+# myloss = LpLoss(size_average=False)
+# for ep in range(epochs):
+#     model.train()
+#     t1 = default_timer()
+#     train_mse = 0
+#     for x, y in tqdm.tqdm(train_loader):
+#
+#         optimizer.zero_grad()
+#         out = model(x)
+#         out = out.view(out.shape[0], WIDTH, HEIGHT, T)
+#
+#         mse = F.mse_loss(out, y, reduction='mean')
+#         mse.backward()
+#
+#         # y = y_normalizer.decode(y)
+#         # out = y_normalizer.decode(out)
+#         # l2 = myloss(out, y)
+#         # l2.backward()
+#
+#         optimizer.step()
+#         scheduler.step()
+#         train_mse += mse.item()
+#
+#     model.eval()
+#     test_mse = 0.0
+#     with torch.no_grad():
+#         for x, y in test_loader:
+#             out = model(x)
+#             out = out.view(out.shape[0], WIDTH, HEIGHT, T)
+#             out = y_normalizer.decode(out)
+#             test_mse += F.mse_loss(out, y).item()
+#
+#     train_mse /= len(train_loader)
+#     test_mse /= ntest
+#
+#     t2 = default_timer()
+#     print("epoch: ", ep, " train loss: ", train_mse, " test loss: ", test_mse)
+#     if test_mse < min_mse:
+#         min_mse = test_mse
+#         torch.save(model, path_model)
+#         print("Model saved, min_mse: ", min_mse)
 
 # =============================
 model = torch.load(path_model)
-pred = torch.zeros(test_u.shape)
+pred_original = []
 index = 0
 test_loss = 0
 test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(test_a, test_u), batch_size=1, shuffle=False)
-with torch.no_grad():
-    for x, y in test_loader:
+first = True
 
+x, _ = next(iter(test_loader))
+with torch.no_grad():
+    for i in range(len(test_loader)*2):
+        if first:
+            first = False
+        else:
+            x = pred.unsqueeze(4).repeat([1,1,1,1,T])
         out = model(x)
         out = out.view(out.shape[0], WIDTH, HEIGHT, T)
         out = y_normalizer.decode(out)
-        pred[index] = out
+        pred = out
+        pred_original.append(pca.inverse_transform(out.reshape(WIDTH * HEIGHT, T).permute(1, 0)))
+
+
+test_loss = 0
+with torch.no_grad():
+    for x, y in test_loader:
+        if first:
+            first = False
+        else:
+            x = pred.unsqueeze(4).repeat([1,1,1,1,T])
+        out = model(x)
+        out = out.view(out.shape[0], WIDTH, HEIGHT, T)
+        out = y_normalizer.decode(out)
+        pred = out
+        pred_original.append(pca.inverse_transform(out.reshape(WIDTH * HEIGHT, T).permute(1, 0)))
 
         test_loss += F.mse_loss(out, y, reduction='mean')
         print(index, test_loss)
         index = index + 1
-
-scipy.io.savemat('pred/'+path+'.mat', mdict={'pred': pred.cpu().numpy()})
-
-
-
-
-
+print(torch.sqrt(test_loss))
+save_pickle(pred_original, 'pred/pred')
